@@ -1,0 +1,19 @@
+﻿# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# node
+frontend/node_modules/
