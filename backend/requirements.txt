@@ -6,3 +6,5 @@ pytesseract
 pdf2image
 Pillow
 ocrmypdf
+python-multipart
+python-dotenv
