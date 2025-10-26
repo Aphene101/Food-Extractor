@@ -7,6 +7,22 @@ from fastapi import FastAPI, File, UploadFile
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import pdfplumber
+import shutil, logging
+import pytesseract
+
+pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+
+def check_tools():
+    tools = {
+      "tesseract": shutil.which("tesseract"),
+      "ghostscript": shutil.which("gswin64c") or shutil.which("gs"),
+      "qpdf": shutil.which("qpdf"),
+      "pdftoppm": shutil.which("pdftoppm"),
+    }
+    logging.info("OCR tool availability: %s", tools)
+    return tools
+
+TOOLS = check_tools()
 
 # --- FastAPI setup ---
 app = FastAPI()
@@ -64,43 +80,89 @@ def force_utf8_filename(name: str) -> str:
 
 # --- OCR handling ---
 def run_ocr_if_needed(input_pdf_path, output_pdf_path):
-    """If PDF has little or no text, use OCRmyPDF or pytesseract fallback."""
+    """
+    Try to use ocrmypdf first (captures stderr and returns it in notes if it fails).
+    If ocrmypdf is not available or fails, try a pytesseract/pdf2image fallback.
+    Returns tuple: (path_to_text_or_pdf, ocr_note)
+      - path_to_text_or_pdf: if ocrmypdf produced a searchable PDF, this is that PDF path;
+                             if fallback produced a text file, this is the .txt path;
+                             otherwise it's the original input_pdf_path.
+      - ocr_note: short note string describing what happened (or error text).
+    """
+    import sys
+    # quick check: is ocrmypdf installed?
+    if shutil.which("ocrmypdf") is None:
+        # No ocrmypdf — skip to pytesseract fallback below
+        ocrmypdf_available = False
+    else:
+        ocrmypdf_available = True
+
+    # Helper: detect if PDF already contains text (small heuristic)
     try:
         import PyPDF2
         reader = PyPDF2.PdfReader(input_pdf_path)
-        text = "".join(page.extract_text() or "" for page in reader.pages[:3])
-        if len(text.strip()) > 50:
+        text_preview = ""
+        for p in reader.pages[:3]:
+            text_preview += p.extract_text() or ""
+        if len(text_preview.strip()) >= 80:
+            # likely already contains text; just copy and skip OCR
             shutil.copyfile(input_pdf_path, output_pdf_path)
             return output_pdf_path, "no_ocr_needed"
     except Exception:
+        # if PyPDF2 can't read, we'll try OCR
         pass
 
-    # If ocrmypdf exists, prefer it
-    if shutil.which("ocrmypdf"):
+    # Try ocrmypdf if available
+    if ocrmypdf_available:
         try:
-            subprocess.run(["ocrmypdf", "--deskew", input_pdf_path, output_pdf_path],
-                           check=True, capture_output=True)
+            # run and capture output
+            proc = subprocess.run(
+                ["ocrmypdf", "--deskew", input_pdf_path, output_pdf_path],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, text=True
+            )
+            # success
             return output_pdf_path, "ocr_applied"
         except subprocess.CalledProcessError as e:
-            return input_pdf_path, f"ocr_failed:{e}"
-    else:
-        # fallback to pytesseract
-        try:
-            import pytesseract
-            from pdf2image import convert_from_path
-            from PIL import Image
-            pages = convert_from_path(input_pdf_path)
-            all_text = []
-            for p in pages:
-                txt = pytesseract.image_to_string(p, lang="eng+hun")
-                all_text.append(txt)
-            txt_combined = "\n".join(all_text)
-            tmp_txt = output_pdf_path + ".txt"
-            with open(tmp_txt, "w", encoding="utf-8") as f:
-                f.write(txt_combined)
-            return tmp_txt, "ocr_pytesseract_applied"
+            # capture stderr for debugging and fall back
+            stderr = (e.stderr or "").strip()
+            note = f"ocr_failed:{stderr[:1000]}"  # first 1000 chars of stderr
+            # fall through to fallback attempt below
         except Exception as e:
-            return input_pdf_path, f"ocr_not_available:{e}"
+            note = f"ocr_failed_unexpected:{str(e)}"
+    else:
+        note = "ocrmypdf_not_installed"
+
+    # Fallback: try pytesseract (requires pytesseract + pdf2image + poppler/Tesseract installed)
+    try:
+        # import here so missing packages raise ImportError we can catch
+        import pytesseract
+        from pdf2image import convert_from_path
+        from PIL import Image
+
+        # convert PDF pages to images (this may require poppler)
+        images = convert_from_path(input_pdf_path)
+        ocr_text_parts = []
+        for img in images:
+            # use Hungarian+English if tesseract has 'hun' installed; else fallback to 'eng'
+            try:
+                txt = pytesseract.image_to_string(img, lang="hun+eng")
+            except Exception:
+                txt = pytesseract.image_to_string(img)
+            ocr_text_parts.append(txt)
+        combined = "\n\n".join(ocr_text_parts)
+        # save as UTF-8 text file
+        txt_path = output_pdf_path + ".txt"
+        with open(txt_path, "w", encoding="utf-8") as fh:
+            fh.write(combined)
+        return txt_path, (note + " | pytesseract_ok" if note else "pytesseract_ok")
+    except ImportError as ie:
+        # pytesseract/pdf2image not installed
+        fallback_note = (note + " | pytesseract_missing")
+        return input_pdf_path, fallback_note
+    except Exception as e:
+        # fallback failed
+        fallback_note = (note + " | pytesseract_failed:" + str(e))
+        return input_pdf_path, fallback_note
 
 # --- Text & table extraction ---
 def extract_text_and_tables(pdf_path):
@@ -122,16 +184,31 @@ def extract_text_and_tables(pdf_path):
     return "\n\n".join(text), tables, notes
 
 # --- Allergen & Nutrition extraction ---
-def extract_allergens(text: str):
-    result = {}
-    if not text:
-        for k in ALLERGEN_KEYWORDS:
-            result[k] = "Unknown"
-        return result
+def extract_allergens(text):
+    results = {}
+
+    NEG_WORDS = ["mentes", "nem tartalmaz", "mentesség", "no", "free from"]
+
     for allergen, keywords in ALLERGEN_KEYWORDS.items():
-        found = any(re.search(r"\b" + re.escape(k) + r"\b", text, re.IGNORECASE) for k in keywords)
-        result[allergen] = "Present" if found else "Absent"
-    return result
+        found = False
+        for kword in keywords:
+            if re.search(r"\b" + re.escape(kword) + r"\b", text, re.IGNORECASE):
+                found = True
+
+                for mctx in re.finditer(re.escape(kword), text, re.IGNORECASE):
+                    start = max(0, mctx.start() - 25)
+                    end = min(len(text), mctx.end() + 25)
+                    ctx = text[start:end].lower()
+                    if any(nw in ctx for nw in NEG_WORDS):
+                        found = False
+                        break
+
+                if found:
+                    break  # exit keyword loop early if allergen confirmed
+
+        results[allergen] = "Present" if found else "Absent"
+
+    return results
 
 NUTRITION_REGEX = {
     "Energy": r"(?:energy|energia)[^\d]{0,8}([\d.,]+)\s*(k?cal|kj)?",
@@ -142,18 +219,45 @@ NUTRITION_REGEX = {
     "Sodium": r"(?:sodium|n[aá]trium|salt|s[oó])[^\d]{0,8}([\d.,]+)\s*(g|mg)?"
 }
 
+def _normalize_unit(u: str):
+    if not u:
+        return None
+    u = u.lower().strip()
+    if u in ("g", "gram", "grams"):
+        return "g"
+    if u in ("mg", "milligram", "milligrams"):
+        return "mg"
+    if u in ("kcal", "cal"):
+        return "kcal"
+    if u in ("kj", "kJ", "kj"):
+        return "kJ"
+    # keep as-is if we don't recognize but remove whitespace
+    return u
+
 def extract_nutrition(text):
+    """
+    Return dict: { Nutrient: { value: float, unit: str|None, per: '100g', source: 'label', confidence: float } | None }
+    """
     result = {}
     for k, pattern in NUTRITION_REGEX.items():
         m = re.search(pattern, text, re.IGNORECASE)
         if m:
-            num = m.group(1).replace(",", ".")
+            num = m.group(1).replace(",", ".").strip()
+            unit_raw = (m.group(2) or "").strip()
             try:
                 val = float(num)
-                unit = m.group(2) or "unknown"
-                result[k] = {"value": val, "unit": unit, "per": "100g"}
-            except:
+            except Exception:
+                # numeric parse failed — leave as None (caller can decide how to display)
                 result[k] = None
+                continue
+            unit = _normalize_unit(unit_raw)
+            result[k] = {
+                "value": val,
+                "unit": unit,
+                "per": "100g",
+                "source": "label",
+                "confidence": 0.9
+            }
         else:
             result[k] = None
     return result
