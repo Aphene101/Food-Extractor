@@ -22,10 +22,21 @@ function JSONViewer({ data }) {
   );
 }
 
+function formatNutritionCell(v) {
+  if (!v) return "—";
+  const parts = [];
+  if (v.value !== undefined && v.value !== null) parts.push(v.value);
+  if (v.unit) parts.push(v.unit);
+  // only show source if it's defined and not the generic "unknown"
+  if (v.source && v.source !== "unknown") parts.push(`(${v.source})`);
+  return parts.length ? parts.join(" ") : "—";
+}
+
 export default function App() {
   const [file, setFile] = useState(null);
   const [result, setResult] = useState(null);
   const [loading, setLoading] = useState(false);
+  const [showRaw, setShowRaw] = useState(false);
   const [error, setError] = useState("");
 
   async function uploadFile(e) {
@@ -50,6 +61,7 @@ export default function App() {
       }
       const json = await res.json();
       setResult(json);
+      setShowRaw(false);
     } catch (err) {
       setError(String(err));
       setResult(null);
@@ -67,10 +79,10 @@ export default function App() {
         margin: "0 auto",
       }}
     >
-      <h1 style={{ marginBottom: 6 }}>Food PDF Extractor — MVP</h1>
+      <h1 style={{ marginBottom: 6 }}>Food PDF Extractor</h1>
       <p style={{ color: "#334155" }}>
-        Upload a product PDF (scanned or digital). Backend will return allergens
-        & nutrition JSON.
+        Upload a product PDF (scanned or digital) to return allergens &
+        nutrition JSON.
       </p>
 
       <form
@@ -177,9 +189,7 @@ export default function App() {
                         borderBottom: "1px solid #e6eef8",
                       }}
                     >
-                      {v
-                        ? `${v.value} ${v.unit} (${v.source || "unknown"})`
-                        : "—"}
+                      {formatNutritionCell(v)}
                     </td>
                   </tr>
                 ))}
@@ -188,11 +198,80 @@ export default function App() {
           </div>
 
           <div style={{ gridColumn: "1 / -1" }}>
-            <h3>Raw text extract (first 4k chars)</h3>
-            <div style={{ marginBottom: 8, color: "#334155" }}>
-              {result.filename}
+            <h3>Raw text extract (OCR)</h3>
+
+            <div
+              style={{
+                marginBottom: 8,
+                color: "#334155",
+                display: "flex",
+                gap: 12,
+                alignItems: "center",
+              }}
+            >
+              <div>{result.filename}</div>
+
+              {/* short preview (first 200 chars, cleaned) */}
+              <div style={{ color: "#64748b", fontSize: 13 }}>
+                {result.raw_text_extract
+                  ? result.raw_text_extract.slice(0, 180).replace(/\s+/g, " ") +
+                    (result.raw_text_extract.length > 180 ? "…" : "")
+                  : "No OCR text available"}
+              </div>
+
+              <button
+                onClick={() => setShowRaw((s) => !s)}
+                style={{
+                  marginLeft: "auto",
+                  padding: "6px 8px",
+                  borderRadius: 8,
+                  border: "1px solid #cbd5e1",
+                  background: "#fff",
+                  cursor: "pointer",
+                }}
+              >
+                {showRaw ? "Hide OCR" : "Show OCR output"}
+              </button>
+
+              {/* download raw text (client-side) */}
+              {result.raw_text_extract && (
+                <button
+                  onClick={() => {
+                    const blob = new Blob([result.raw_text_extract], {
+                      type: "text/plain;charset=utf-8",
+                    });
+                    const a = document.createElement("a");
+                    a.href = URL.createObjectURL(blob);
+                    const safeName = (result.filename || "ocr").replace(
+                      /[^a-zA-Z0-9._-]/g,
+                      "_"
+                    );
+                    a.download = safeName + ".ocr.txt";
+                    document.body.appendChild(a);
+                    a.click();
+                    a.remove();
+                  }}
+                  style={{
+                    padding: "6px 8px",
+                    borderRadius: 8,
+                    border: "1px solid #cbd5e1",
+                    background: "#fff",
+                    cursor: "pointer",
+                  }}
+                >
+                  Download OCR
+                </button>
+              )}
             </div>
-            <JSONViewer data={{ raw_text_extract: result.raw_text_extract }} />
+
+            {showRaw && (
+              <div style={{ marginTop: 8 }}>
+                <JSONViewer
+                  data={{ raw_text_extract: result.raw_text_extract }}
+                />
+              </div>
+            )}
+
             <div style={{ marginTop: 12 }}>
               <strong>Notes:</strong>{" "}
               {Array.isArray(result.notes)
@@ -203,12 +282,12 @@ export default function App() {
         </div>
       ) : (
         <div style={{ color: "#64748b" }}>
-          No result yet — upload a PDF to extract data.
+          No result yet, upload a PDF to extract data.
         </div>
       )}
 
       <footer style={{ marginTop: 28, color: "#94a3b8" }}>
-        MVP — React frontend (Vite) • Backend: FastAPI
+        React frontend (Vite) • Backend: FastAPI
       </footer>
     </div>
   );
